@@ -3,13 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/gosuri/uiprogress"
+	"github.com/gosuri/uiprogress/util/strutil"
 	"github.com/urfave/cli"
-	"golang.org/x/net/publicsuffix"
+	"go.ajitem.com/chopper/pkg"
 	"log"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -20,6 +20,10 @@ var (
 	duration                  time.Duration
 	headers                   http.Header
 	location, cookies         bool
+	r                         = make(chan *pkg.Result)
+	done                      = make(chan bool)
+	rslt                      []*pkg.Result
+	err                       error
 )
 
 func main() {
@@ -96,7 +100,7 @@ func ActionFunc(c *cli.Context) {
 	// read concurrency
 	concurrency = c.Int("concurrency")
 	// read and parse duration
-	duration, err := time.ParseDuration(c.String("duration"))
+	duration, err = time.ParseDuration(c.String("duration"))
 	if err != nil {
 		log.Println("incorrect value of duration supplied:", err)
 		_ = cli.ShowAppHelp(c)
@@ -136,50 +140,61 @@ func ActionFunc(c *cli.Context) {
 	// use cookies ?
 	cookies = c.Bool("cookie-jar")
 
-	// prepare to start the firing, set context
-	ctx, cancel := context.WithTimeout(context.Background(), duration)
-	defer cancel()
-
-	// create new request
+	// prepare to start the firing, create new request
 	req, err := http.NewRequest(c.String("request"), c.String("url"), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	// add headers
 	req.Header = headers
 
-	// associate context with the request
-	req = req.WithContext(ctx)
+	request, _ := pkg.NewRequest(req, location, maxRedirects, cookies)
 
-	processRequest(req, 0)
-
-	fmt.Println("done")
-}
-
-func processRequest(req *http.Request, redirectCount int) {
-	if redirectCount > maxRedirects {
-		return
-	}
-
-	client := &http.Client{}
-	if cookies {
-		jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
-		if err != nil {
-			log.Fatal(err)
+	// setup receiver
+	go func() {
+		for res := range r {
+			rslt = append(rslt, res)
 		}
+		done <- true
+	}()
 
-		client.Jar = jar
+	// setup context
+	start := time.Now()
+	ctx, _ := context.WithTimeout(context.Background(), duration)
+	go func() {
+		select {
+		case <-ctx.Done():
+			close(r)
+		}
+	}()
+
+	uiprogress.Start()
+	for i := 0; i < concurrency; i++ {
+		go func(request *pkg.Request, index int) {
+			bar := uiprogress.AddBar(int(duration.Microseconds())).AppendCompleted()
+			bar.TimeStarted = start
+			bar.PrependFunc(func(b *uiprogress.Bar) string {
+				return fmt.Sprintf("%s %s", strutil.PadLeft(fmt.Sprintf("worker %3d", index), 5, ' '), strutil.PadLeft(strutil.PrettyTime(time.Since(start)), 1, ' '))
+			})
+
+			for {
+				r <- request.Do(0)
+
+				elapsed := time.Since(start).Microseconds()
+				_ = bar.Set(int(elapsed))
+			}
+		}(request, i)
 	}
 
-	res, err := client.Do(req)
-	if err != nil {
-		log.Fatal(err)
-	}
+	<-done
 
-	if location && (res.StatusCode >= 300 && res.StatusCode < 400) {
-		req.URL, _ = url.Parse(res.Header.Get("Location"))
-		processRequest(req, redirectCount+1)
-	}
+	results := pkg.NewResults(rslt)
 
-	fmt.Println("Response received, status code:", res.StatusCode)
+	fmt.Println("Total requests completed:", results.TotalRequests())
+	fmt.Println("Requests per second:", results.RequestsPerSecond(duration))
+
+	fmt.Println("Fastest Request Time:", results.Fastest())
+	fmt.Println("Slowest Request Time:", results.Slowest())
+	fmt.Println("Average Request Time:", results.Average())
 }
