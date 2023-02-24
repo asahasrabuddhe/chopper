@@ -7,5 +7,5 @@ require (
 	github.com/gosuri/uiprogress v0.0.1
 	github.com/mattn/go-isatty v0.0.9 // indirect
 	github.com/urfave/cli v1.22.1
-	golang.org/x/net v0.0.0-20190923162816-aa69164e4478
+	golang.org/x/net v0.7.0
 )
